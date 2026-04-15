@@ -1,8 +1,0 @@
-# appsettings.local.json — put your real API key here (this file is git-ignored)
-# Copy the template below into appsettings.local.json:
-#
-# {
-#   "OpenAI": {
-#     "ApiKey": "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"
-#   }
-# }
