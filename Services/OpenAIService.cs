@@ -6,10 +6,12 @@ namespace OPenAIPDSQandA.Services;
 public class OpenAIService
 {
     private readonly ChatClient _chatClient;
+    private readonly string _systemPrompt;
 
-    public OpenAIService(string apiKey, string model)
+    public OpenAIService(string apiKey, string model, string systemPrompt)
     {
         _chatClient = new ChatClient(model, new ApiKeyCredential(apiKey));
+        _systemPrompt = systemPrompt;
     }
 
     /// <summary>
@@ -23,25 +25,11 @@ public class OpenAIService
         CancellationToken cancellationToken = default)
     {
         var context = string.Join("\n\n---\n\n", retrievedChunks);
+        var systemMessage = _systemPrompt.Replace("{context}", context);
 
         var messages = new List<ChatMessage>
         {
-            ChatMessage.CreateSystemMessage(
-                $"""
-                You are a helpful travel insurance expert assistant.
-                Answer the user's question using ONLY the relevant excerpts from the
-                Product Disclosure Statement (PDS) provided below.
-
-                Guidelines:
-                - If the answer is not in the excerpts, say so clearly
-                - Be concise but thorough
-                - Reference specific sections when possible
-                - Use plain language to explain insurance terminology
-
-                --- RELEVANT PDS EXCERPTS ---
-                {context}
-                --- END OF EXCERPTS ---
-                """)
+            ChatMessage.CreateSystemMessage(systemMessage)
         };
 
         foreach (var turn in history)

@@ -26,6 +26,9 @@ var config = new ConfigurationBuilder()
 string apiKey       = config["OpenAI:ApiKey"] ?? "";
 string model        = config["OpenAI:Model"] ?? "gpt-4o";
 string embedModel   = config["OpenAI:EmbeddingModel"] ?? "text-embedding-3-small";
+string systemPrompt = string.Join("\n", config.GetSection("OpenAI:SystemPrompt")
+                          .GetChildren()
+                          .Select(c => c.Value ?? ""));
 
 // ── Check the API key before doing anything else ──
 if (string.IsNullOrWhiteSpace(apiKey) || apiKey == "your-openai-api-key-here")
@@ -48,7 +51,7 @@ if (string.IsNullOrWhiteSpace(apiKey) || apiKey == "your-openai-api-key-here")
 // OpenAIService    — sends questions + context to GPT and streams the answer
 var documentService = new DocumentService();
 var ragService      = new RagService(apiKey, embedModel);
-var openAIService   = new OpenAIService(apiKey, model);
+var openAIService   = new OpenAIService(apiKey, model, systemPrompt);
 
 // This list stores the conversation so the assistant remembers previous messages
 var conversationHistory = new List<ConversationTurn>();
