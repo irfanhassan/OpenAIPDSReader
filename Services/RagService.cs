@@ -1,54 +1,64 @@
 using OpenAI.Embeddings;
+using Qdrant.Client;
+using Qdrant.Client.Grpc;
 using System.ClientModel;
 
 namespace OPenAIPDSQandA.Services;
 
 /// <summary>
-/// Retrieval-Augmented Generation service.
-/// Splits a document into overlapping chunks, generates embeddings for each chunk
-/// using batch API calls, and retrieves the most relevant chunks for a given query
-/// using cosine similarity.
+/// Retrieval-Augmented Generation service backed by Qdrant vector database.
+/// Splits the document into overlapping chunks, generates OpenAI embeddings,
+/// stores them in Qdrant, and retrieves the most relevant chunks by cosine similarity.
 /// </summary>
 public class RagService
 {
     private readonly EmbeddingClient _embeddingClient;
-    private readonly List<DocumentChunk> _index = new();
+    private readonly QdrantClient _qdrant;
 
-    // ~1 500 chars ≈ 375 tokens — keeps embeddings meaningful and context tight
-    private const int ChunkSize    = 1_500;
-    private const int ChunkOverlap = 250;
-    private const int DefaultTopK  = 5;
+    private const string CollectionName  = "pds_chunks";
+    private const int    ChunkSize       = 1_500;
+    private const int    ChunkOverlap    = 250;
+    private const int    DefaultTopK     = 5;
+    private const int    EmbeddingBatchSize = 64;
 
-    /// <summary>How many chunks to embed per API call (OpenAI allows up to 2 048).</summary>
-    private const int EmbeddingBatchSize = 64;
+    // Qdrant needs to know the vector size up front — text-embedding-3-small produces 1536 floats
+    private const uint VectorSize = 1_536;
 
-    public int ChunkCount => _index.Count;
+    public int ChunkCount { get; private set; }
 
-    public RagService(string apiKey, string embeddingModel = "text-embedding-3-small")
+    public RagService(string apiKey, string embeddingModel = "text-embedding-3-small",
+                      string qdrantHost = "localhost", int qdrantPort = 6334)
     {
         _embeddingClient = new EmbeddingClient(embeddingModel, new ApiKeyCredential(apiKey));
+
+        // QdrantClient communicates over gRPC (port 6334 by default)
+        _qdrant = new QdrantClient(qdrantHost, qdrantPort);
     }
 
     // -------------------------------------------------------------------------
     // Indexing
     // -------------------------------------------------------------------------
 
-    /// <summary>
-    /// Chunks the document and embeds every chunk using batch API calls.
-    /// Call this once after loading the PDS.
-    /// </summary>
     public async Task BuildIndexAsync(
         string documentText,
         Action<int, int>? onProgress = null,
         CancellationToken ct = default)
     {
-        _index.Clear();
+        // Re-create the collection fresh each time so old data doesn't bleed in
+        var collections = await _qdrant.ListCollectionsAsync(ct);
+        if (collections.Any(c => c == CollectionName))
+            await _qdrant.DeleteCollectionAsync(CollectionName, cancellationToken: ct);
+
+        await _qdrant.CreateCollectionAsync(
+            CollectionName,
+            new VectorParams { Size = VectorSize, Distance = Distance.Cosine },
+            cancellationToken: ct);
 
         var chunks = ChunkDocument(documentText);
         int total  = chunks.Count;
         int done   = 0;
 
-        // Embed in batches — one API call per batch instead of one per chunk
+        // Embed and upsert in batches
         for (int batchStart = 0; batchStart < total; batchStart += EmbeddingBatchSize)
         {
             ct.ThrowIfCancellationRequested();
@@ -57,59 +67,63 @@ public class RagService
             var batch      = chunks.GetRange(batchStart, batchEnd - batchStart);
             var embeddings = await EmbedBatchAsync(batch, ct);
 
-            for (int j = 0; j < batch.Count; j++)
+            // Build Qdrant points — each point has an ID, a vector, and a payload
+            var points = batch.Select((text, i) => new PointStruct
             {
-                _index.Add(new DocumentChunk(batch[j], embeddings[j], batchStart + j));
-                onProgress?.Invoke(++done, total);
-            }
+                Id      = (ulong)(batchStart + i),
+                Vectors = embeddings[i],
+                Payload =
+                {
+                    // Store the original text and its position so we can sort results later
+                    ["text"]  = text,
+                    ["index"] = batchStart + i
+                }
+            }).ToList();
+
+            await _qdrant.UpsertAsync(CollectionName, points, cancellationToken: ct);
+
+            done += batch.Count;
+            onProgress?.Invoke(done, total);
         }
+
+        ChunkCount = total;
     }
 
     // -------------------------------------------------------------------------
     // Retrieval
     // -------------------------------------------------------------------------
 
-    /// <summary>
-    /// Returns the top-K most relevant chunks for the query, in document order.
-    /// </summary>
     public async Task<string[]> RetrieveAsync(
         string query,
         int topK = DefaultTopK,
         CancellationToken ct = default)
     {
-        if (_index.Count == 0)
-            return [];
-
-        var queryEmbedding = await EmbedSingleAsync(query, ct);
-
-        return _index
-            .Select(c => (chunk: c, score: CosineSimilarity(queryEmbedding, c.Embedding)))
-            .OrderByDescending(x => x.score)
-            .Take(topK)
-            .OrderBy(x => x.chunk.Index)   // restore document reading order
-            .Select(x => x.chunk.Text)
-            .ToArray();
+        var results = await RetrieveWithScoresAsync(query, topK, ct);
+        return results.Select(r => r.Text).ToArray();
     }
 
-    /// <summary>
-    /// Returns the top-K most relevant chunks together with their similarity scores.
-    /// </summary>
     public async Task<(string Text, float Score)[]> RetrieveWithScoresAsync(
         string query,
         int topK = DefaultTopK,
         CancellationToken ct = default)
     {
-        if (_index.Count == 0)
+        if (ChunkCount == 0)
             return [];
 
         var queryEmbedding = await EmbedSingleAsync(query, ct);
 
-        return _index
-            .Select(c => (chunk: c, score: CosineSimilarity(queryEmbedding, c.Embedding)))
-            .OrderByDescending(x => x.score)
-            .Take(topK)
-            .OrderBy(x => x.chunk.Index)   // restore document reading order
-            .Select(x => (x.chunk.Text, x.score))
+        // Ask Qdrant for the top-K most similar vectors, including the stored payload
+        var hits = await _qdrant.SearchAsync(
+            CollectionName,
+            queryEmbedding,
+            limit: (ulong)topK,
+            payloadSelector: new WithPayloadSelector { Enable = true },
+            cancellationToken: ct);
+
+        // Sort by original document position (index) so context reads in order
+        return hits
+            .OrderBy(h => (int)h.Payload["index"].IntegerValue)
+            .Select(h => (Text: h.Payload["text"].StringValue, Score: h.Score))
             .ToArray();
     }
 
@@ -126,7 +140,6 @@ public class RagService
     private async Task<List<float[]>> EmbedBatchAsync(List<string> texts, CancellationToken ct)
     {
         var result = await _embeddingClient.GenerateEmbeddingsAsync(texts, cancellationToken: ct);
-        // Results are returned in the same order as the inputs
         return result.Value
                      .OrderBy(e => e.Index)
                      .Select(e => e.ToFloats().ToArray())
@@ -142,7 +155,6 @@ public class RagService
         {
             int end = Math.Min(start + ChunkSize, text.Length);
 
-            // Prefer splitting at a paragraph boundary to keep semantic units intact
             if (end < text.Length)
             {
                 int searchFrom = Math.Max(start + ChunkSize / 2, 0);
@@ -165,25 +177,11 @@ public class RagService
             if (chunk.Length > 50)
                 chunks.Add(chunk);
 
-            // Advance with overlap so context isn't lost at chunk boundaries
             start = Math.Max(start + 1, end - ChunkOverlap);
         }
 
         return chunks;
     }
-
-    private static float CosineSimilarity(float[] a, float[] b)
-    {
-        float dot = 0f, magA = 0f, magB = 0f;
-        for (int i = 0; i < a.Length; i++)
-        {
-            dot  += a[i] * b[i];
-            magA += a[i] * a[i];
-            magB += b[i] * b[i];
-        }
-        float denom = MathF.Sqrt(magA) * MathF.Sqrt(magB);
-        return denom == 0f ? 0f : dot / denom;
-    }
 }
 
-public record DocumentChunk(string Text, float[] Embedding, int Index);
+// DocumentChunk record is no longer needed — data lives in Qdrant payloads
