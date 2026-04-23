@@ -30,6 +30,10 @@ string systemPrompt = string.Join("\n", config.GetSection("OpenAI:SystemPrompt")
                           .GetChildren()
                           .Select(c => c.Value ?? ""));
 
+// Read Qdrant connection settings
+string qdrantHost = config["Qdrant:Host"] ?? "localhost";
+int    qdrantPort = int.TryParse(config["Qdrant:Port"], out var p) ? p : 6334;
+
 // ── Check the API key before doing anything else ──
 if (string.IsNullOrWhiteSpace(apiKey) || apiKey == "your-openai-api-key-here")
 {
@@ -50,7 +54,7 @@ if (string.IsNullOrWhiteSpace(apiKey) || apiKey == "your-openai-api-key-here")
 // RagService       — splits the document into chunks and finds relevant ones
 // OpenAIService    — sends questions + context to GPT and streams the answer
 var documentService = new DocumentService();
-var ragService      = new RagService(apiKey, embedModel);
+var ragService      = new RagService(apiKey, embedModel, qdrantHost, qdrantPort);
 var openAIService   = new OpenAIService(apiKey, model, systemPrompt);
 
 // This list stores the conversation so the assistant remembers previous messages
